@@ -1043,7 +1043,7 @@ async function analyzeFromSearch() {
 async function runAnalysis(ticker) {
   currentTicker = ticker;
   setStatus(`Resolving CIK for ${ticker}...`, 'loading');
-  showLoading(`Fetching SEC data for ${ticker}...`);
+  showLoading(`Fetching SEC EDGAR data for ${ticker}...<br><small style='color:var(--text3);font-size:10px;'>Large companies may take 15–30 seconds to download</small>`);
 
   try {
     // Step 1: Resolve CIK
@@ -1178,32 +1178,70 @@ async function resolveCIK(ticker) {
 // =============================================
 // CORS-SAFE FETCH LAYER
 // =============================================
-// data.sec.gov sends CORS headers, but networks/browsers sometimes block
-// the preflight. We try direct first, then fall back through public proxies.
-const PROXIES = [
-  url => url,                                                                      // direct
-  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,                      // corsproxy.io
-  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,         // allorigins
-  url => `https://thingproxy.freeboard.io/fetch/${url}`,                          // thingproxy
+// SEC companyfacts JSON can be 5-50MB. We need no timeout on the download
+// itself — only a connection timeout. Strategy: try direct first (works on
+// GitHub Pages / Netlify), then fall through CORS proxies.
+//
+// NOTE: AbortSignal.timeout() aborts the ENTIRE request including download.
+// Instead we use a manual connection-only race so large files can stream.
+
+async function fetchWithConnectTimeout(url, connectMs) {
+  // Race: either the response headers arrive, or we abort.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), connectMs);
+  try {
+    const resp = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    return resp; // headers received — let body stream freely
+  } catch(e) {
+    clearTimeout(timer);
+    throw e;
+  }
+}
+
+// Ordered list of URL transformers. Direct is always tried first.
+const PROXY_STRATEGIES = [
+  { name: 'direct',      make: url => url },
+  { name: 'corsproxy',   make: url => `https://corsproxy.io/?${encodeURIComponent(url)}` },
+  { name: 'allorigins',  make: url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` },
+  { name: 'thingproxy',  make: url => `https://thingproxy.freeboard.io/fetch/${url}` },
 ];
 
+// Remember which strategy succeeded last so we skip straight to it next time
+let preferredProxyIdx = 0;
+
 async function secFetch(url) {
+  // Reorder so preferred strategy is tried first
+  const order = [
+    preferredProxyIdx,
+    ...PROXY_STRATEGIES.map((_,i) => i).filter(i => i !== preferredProxyIdx)
+  ];
+
   let lastErr;
-  for (const makeUrl of PROXIES) {
-    const proxied = makeUrl(url);
+  for (const idx of order) {
+    const { name, make } = PROXY_STRATEGIES[idx];
+    const proxied = make(url);
     try {
-      const resp = await fetch(proxied, { signal: AbortSignal.timeout(14000) });
+      setStatus(`Fetching via ${name}...`, 'loading');
+      // 20s connection timeout — enough for any network; body streams freely after
+      const resp = await fetchWithConnectTimeout(proxied, 20000);
       if (resp.ok) {
-        console.log(`secFetch OK via: ${proxied.startsWith(url) ? 'direct' : proxied.split('?')[0]}`);
+        preferredProxyIdx = idx; // remember winner
+        console.log(`secFetch OK [${name}]:`, url.split('/').pop());
         return resp;
       }
-      lastErr = new Error(`HTTP ${resp.status}`);
+      lastErr = new Error(`HTTP ${resp.status} (${name})`);
     } catch (e) {
       lastErr = e;
-      console.warn(`secFetch proxy failed (${proxied.slice(0,60)}...):`, e.message);
+      // "The user aborted a request" = connect timeout — try next proxy
+      console.warn(`secFetch [${name}] failed:`, e.message);
     }
   }
-  throw new Error(`All fetch strategies failed for ${url} — ${lastErr?.message || 'unknown error'}`);
+  throw new Error(
+    `SEC data unavailable after trying all proxies. ` +
+    `Last error: ${lastErr?.message}. ` +
+    `Check your internet connection or try again in a moment.`
+  );
 }
 
 // =============================================
@@ -1211,8 +1249,9 @@ async function secFetch(url) {
 // =============================================
 async function fetchCompanyFacts(cik) {
   const url = `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`;
-  setStatus(`Fetching XBRL facts for CIK ${cik}...`, 'loading');
+  setStatus(`Downloading SEC financials (may take 10-30s for large companies)...`, 'loading');
   const resp = await secFetch(url);
+  setStatus(`Parsing financial data...`, 'loading');
   return resp.json();
 }
 
