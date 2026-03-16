@@ -1090,67 +1090,9 @@ async function runAnalysis(ticker) {
 // CIK RESOLUTION
 // =============================================
 async function resolveCIK(ticker) {
-  // Normalize: SEC uses BRK-B style, some users type BRK.B
   const t = ticker.toUpperCase().replace('.', '-');
 
-  // Strategy 1: EDGAR company search API — CORS-friendly, returns JSON
-  // This is the official EDGAR full-text search, works from browsers
-  try {
-    const url = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(t)}%22&dateRange=custom&startdt=2000-01-01&enddt=2099-12-31&forms=10-K`;
-    const resp = await fetch(url);
-    if (resp.ok) {
-      const data = await resp.json();
-      const hits = data.hits?.hits || [];
-      for (const hit of hits) {
-        // Check if ticker matches exactly in the entity_id or ticker field
-        const src = hit._source || {};
-        if (src.period_of_report && src.entity_id) {
-          return String(src.entity_id).padStart(10, '0');
-        }
-      }
-    }
-  } catch(e) { console.warn('Strategy 1 failed:', e); }
-
-  // Strategy 2: EDGAR company name/ticker search — the most reliable CORS-safe endpoint
-  try {
-    const url = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(t)}%22&forms=10-K`;
-    const resp = await fetch(url);
-    if (resp.ok) {
-      const data = await resp.json();
-      const hits = data.hits?.hits || [];
-      if (hits.length > 0 && hits[0]._source?.entity_id) {
-        return String(hits[0]._source.entity_id).padStart(10, '0');
-      }
-    }
-  } catch(e) { console.warn('Strategy 2 failed:', e); }
-
-  // Strategy 3: EDGAR company search by ticker via the submissions search
-  // data.sec.gov is CORS-enabled for browser requests
-  try {
-    const url = `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(t)}%22`;
-    const resp = await fetch(url);
-    if (resp.ok) {
-      const data = await resp.json();
-      const hits = data.hits?.hits || [];
-      if (hits.length > 0 && hits[0]._source?.entity_id) {
-        return String(hits[0]._source.entity_id).padStart(10, '0');
-      }
-    }
-  } catch(e) { console.warn('Strategy 3 failed:', e); }
-
-  // Strategy 4: Use the EDGAR company search UI endpoint (JSON response, CORS-safe)
-  try {
-    const url = `https://www.sec.gov/cgi-bin/browse-edgar?company=&CIK=${encodeURIComponent(t)}&type=10-K&dateb=&owner=include&count=5&search_text=&action=getcompany&output=atom`;
-    const resp = await fetch(url);
-    if (resp.ok) {
-      const text = await resp.text();
-      // Parse CIK from Atom XML response
-      const match = text.match(/CIK=(\d+)/i) || text.match(/<cik>(\d+)<\/cik>/i);
-      if (match) return String(match[1]).padStart(10, '0');
-    }
-  } catch(e) { console.warn('Strategy 4 failed:', e); }
-
-  // Strategy 5: Hardcoded map for most common tickers as reliable fallback
+  // ── Step 1: Hardcoded map (instant, no network) ──────────────────────────
   const KNOWN_CIKS = {
     'AAPL':'0000320193','MSFT':'0000789019','GOOGL':'0001652044','GOOG':'0001652044',
     'AMZN':'0001018724','META':'0001326801','TSLA':'0001318605','NVDA':'0001045810',
@@ -1173,16 +1115,95 @@ async function resolveCIK(ticker) {
     'SBUX':'0000829224','F':'0000037996','GM':'0001467858','RIVN':'0001874178',
     'LCID':'0001409375','LLY':'0000059478','PFE':'0000078003','MRNA':'0001682852',
     'BNTX':'0001776985','AZN':'0001310780','NVO':'0000353278','SNY':'0001121404',
+    'T':'0000732717','TMUS':'0001283699','NFLX':'0001065280','PINS':'0001506293',
+    'SNAP':'0001564408','TWTR':'0001418091','RBLX':'0001315098','COIN':'0001679273',
+    'HOOD':'0001783879','SOFI':'0001802768','AFRM':'0001820175','UPST':'0001647639',
+    'DKNG':'0001800227','PENN':'0000921738','MGM':'0000789570','LVS':'0001300514',
+    'WYNN':'0001174922','CZR':'0000858339','BYD':'0000906553','CHDN':'0000019617',
+    'WBA':'0000105770','CVS':'0000064803','RAD':'0000084129','MCK':'0000927653',
+    'ABC':'0001140859','CAH':'0000721371','CI':'0001739940','HUM':'0000049071',
+    'MOH':'0001179929','CNC':'0001071739','ELV':'0001156039','ANTM':'0001156039',
+    'AET':'0001122304','AFL':'0000004977','MET':'0001099219','PRU':'0001137774',
+    'LNC':'0000059558','UNM':'0000005513','PFG':'0001126328','AIG':'0000005272',
+    'CB':'0000896159','ALL':'0000899051','PGR':'0000080661','TRV':'0000086312',
+    'HIG':'0000874766','WRB':'0000011544','MKL':'0001096343','RNR':'0000901251',
+    'GOOG':'0001652044','GOOGL':'0001652044','ALPHABET':'0001652044',
   };
 
-  const cik = KNOWN_CIKS[t] || KNOWN_CIKS[ticker.toUpperCase()];
-  if (cik) return cik;
+  if (KNOWN_CIKS[t]) {
+    setStatus(`CIK resolved from cache for ${t}`, 'loading');
+    return KNOWN_CIKS[t];
+  }
+
+  // ── Step 2: Live EDGAR APIs (via CORS proxy if needed) ───────────────────
+  // Try EDGAR full-text search — returns entity_id in _source
+  const searchUrls = [
+    `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(t)}%22&forms=10-K`,
+    `https://efts.sec.gov/LATEST/search-index?q=%22${encodeURIComponent(t)}%22`,
+  ];
+
+  for (const url of searchUrls) {
+    try {
+      const resp = await secFetch(url);
+      if (resp.ok) {
+        const data = await resp.json();
+        const hits = data.hits?.hits || [];
+        for (const hit of hits) {
+          if (hit._source?.entity_id) {
+            return String(hit._source.entity_id).padStart(10, '0');
+          }
+        }
+      }
+    } catch(e) { console.warn('EDGAR search failed:', e.message); }
+  }
+
+  // Try EDGAR company browse (XML atom)
+  try {
+    const url = `https://www.sec.gov/cgi-bin/browse-edgar?company=&CIK=${encodeURIComponent(t)}&type=10-K&dateb=&owner=include&count=5&search_text=&action=getcompany&output=atom`;
+    const resp = await secFetch(url);
+    if (resp.ok) {
+      const text = await resp.text();
+      const match = text.match(/CIK=0*(\d+)/i) || text.match(/<cik>(\d+)<\/cik>/i);
+      if (match) return String(match[1]).padStart(10, '0');
+    }
+  } catch(e) { console.warn('EDGAR browse failed:', e.message); }
 
   throw new Error(
     `Could not resolve CIK for "${ticker}". ` +
-    `This can happen due to browser CORS restrictions on SEC servers. ` +
-    `Try: AAPL, MSFT, GOOGL, AMZN, KO, WMT, JNJ, BRK-B, TSLA, NVDA, NFLX, META.`
+    `Try one of the tickers shown below, or check the exact SEC ticker spelling.`
   );
+}
+
+
+// =============================================
+// CORS-SAFE FETCH LAYER
+// =============================================
+// data.sec.gov sends CORS headers, but networks/browsers sometimes block
+// the preflight. We try direct first, then fall back through public proxies.
+const PROXIES = [
+  url => url,                                                                      // direct
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,                      // corsproxy.io
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,         // allorigins
+  url => `https://thingproxy.freeboard.io/fetch/${url}`,                          // thingproxy
+];
+
+async function secFetch(url) {
+  let lastErr;
+  for (const makeUrl of PROXIES) {
+    const proxied = makeUrl(url);
+    try {
+      const resp = await fetch(proxied, { signal: AbortSignal.timeout(14000) });
+      if (resp.ok) {
+        console.log(`secFetch OK via: ${proxied.startsWith(url) ? 'direct' : proxied.split('?')[0]}`);
+        return resp;
+      }
+      lastErr = new Error(`HTTP ${resp.status}`);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`secFetch proxy failed (${proxied.slice(0,60)}...):`, e.message);
+    }
+  }
+  throw new Error(`All fetch strategies failed for ${url} — ${lastErr?.message || 'unknown error'}`);
 }
 
 // =============================================
@@ -1190,8 +1211,8 @@ async function resolveCIK(ticker) {
 // =============================================
 async function fetchCompanyFacts(cik) {
   const url = `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`EDGAR facts not available (CIK: ${cik})`);
+  setStatus(`Fetching XBRL facts for CIK ${cik}...`, 'loading');
+  const resp = await secFetch(url);
   return resp.json();
 }
 
@@ -1416,7 +1437,7 @@ function computeAIScore(fin, formulaResult) {
 async function fetchFilings(cik) {
   try {
     const url = `https://data.sec.gov/submissions/CIK${cik}.json`;
-    const resp = await fetch(url);
+    const resp = await secFetch(url);
     const data = await resp.json();
     const recent = data.filings?.recent || {};
     const forms = recent.form || [];
