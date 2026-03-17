@@ -293,7 +293,7 @@ body::before {
       <div class="welcome-title">Buffett-Grade Stock Intelligence</div>
       <div class="welcome-sub">
         Real-time financials via Financial Modeling Prep.<br>
-        10-year history · Dual scoring · SEC filings · Competitors<br><br>
+        10-year history · Dual scoring · Competitors<br><br>
         <span style="color:var(--text2)">AAPL · BRK-B · KO · WMT · JNJ · MSFT · NVDA · TSLA</span>
       </div>
     </div>
@@ -415,20 +415,15 @@ async function runAnalysis(ticker) {
     currentCompany = co.companyName || ticker;
     setStatus(`Fetching 10-year financials for ${currentCompany}...`, 'loading');
 
-    const [income, balanceSheet, cashFlow, keyMetrics, filings] = await Promise.all([
+    const [income, balanceSheet, cashFlow, keyMetrics] = await Promise.all([
       fmp('/income-statement',       { symbol: ticker, limit: 10 })
         .catch(e => { console.warn('income-statement:', e.message); return []; }),
       fmp('/balance-sheet-statement',{ symbol: ticker, limit: 10 })
         .catch(e => { console.warn('balance-sheet:', e.message); return []; }),
       fmp('/cash-flow-statement',    { symbol: ticker, limit: 10 })
         .catch(e => { console.warn('cash-flow:', e.message); return []; }),
-      fmp('/key-metrics',            { symbol: ticker, limit: 10 })
-        .catch(e => {
-          console.warn('key-metrics failed, trying ratios:', e.message);
-          return fmp('/ratios', { symbol: ticker, limit: 10 }).catch(() => []);
-        }),
-      fmp('/sec-filings',            { symbol: ticker, limit: 30 })
-        .catch(() => []),
+      fmp('/key-metrics',            { symbol: ticker, limit: 10 }).catch(() => []),
+
     ]);
 
     if (!income.length && !balanceSheet.length && !cashFlow.length) {
@@ -446,7 +441,7 @@ async function runAnalysis(ticker) {
     const aiScore      = computeAIScore(fin, formulaScore, co);
 
     setStatus(`Analysis complete for ${ticker}`, 'ok');
-    renderAnalysis(ticker, co, fin, formulaScore, aiScore, filings);
+    renderAnalysis(ticker, co, fin, formulaScore, aiScore);
     updateWatchlistEntry(ticker, formulaScore, aiScore);
 
   } catch (err) {
@@ -654,7 +649,7 @@ function computeAIScore(fin, formulaResult, profile) {
 // ─────────────────────────────────────────────────────────────────────────────
 // RENDER
 // ─────────────────────────────────────────────────────────────────────────────
-function renderAnalysis(ticker, profile, fin, formulaResult, aiResult, filings) {
+function renderAnalysis(ticker, profile, fin, formulaResult, aiResult) {
   const main = document.getElementById('main');
   const sc = s => s >= 70 ? 'high' : s >= 40 ? 'mid' : 'low';
   const price = profile.price ? `$${Number(profile.price).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2})}` : '—';
@@ -698,7 +693,6 @@ function renderAnalysis(ticker, profile, fin, formulaResult, aiResult, filings) 
       <div class="tab active" onclick="switchTab('overview',this)">Overview</div>
       <div class="tab" onclick="switchTab('charts',this)">10-Year Charts</div>
       <div class="tab" onclick="switchTab('competitors',this)">Competitors</div>
-      <div class="tab" onclick="switchTab('filings',this)">SEC Filings</div>
     </div>
 
     <div class="tab-content active" id="tab-overview">
@@ -727,10 +721,6 @@ function renderAnalysis(ticker, profile, fin, formulaResult, aiResult, filings) 
       </div>
     </div>
 
-    <div class="tab-content" id="tab-filings">
-      <div class="section-title">Recent SEC Filings</div>
-      ${renderFilings(filings, ticker)}
-    </div>
   </div>`;
 }
 
@@ -871,48 +861,6 @@ function renderDebtChart(data) {
   </div>`;
 }
 
-function renderFilings(filings, ticker) {
-  if (!filings || !filings.length) return `<div style="font-family:var(--mono);font-size:11px;color:var(--text3);">No filings returned — check your FMP plan includes SEC filings endpoint.</div>`;
-
-  const typeClass = f => {
-    if (f.includes('10-K')) return 'tenk';
-    if (f.includes('10-Q')) return 'tenq';
-    if (f.includes('DEF')) return 'def14a';
-    return 'eightk';
-  };
-  const typeDesc = f => {
-    if (f.includes('10-K')) return 'Annual report — financials, risk factors, MD&A';
-    if (f.includes('10-Q')) return 'Quarterly report — unaudited interim financials';
-    if (f.includes('DEF 14A') || f.includes('DEF14A')) return 'Proxy statement — exec comp, shareholder votes';
-    return 'Current report — material events, management changes';
-  };
-  const narratives = {
-    '10-K': `<span class="flag-green">🟢 Review MD&A for management commentary on margin sustainability and growth outlook.</span><br><br><span class="flag-yellow">🟡 Check Critical Accounting Estimates for changes in depreciation, goodwill, or revenue recognition.</span><br><br><span class="flag-red">🔴 Scan Risk Factors for litigation, regulatory exposure, and related-party transactions. Any "material weakness" is a serious red flag.</span>`,
-    '10-Q': `<span class="flag-green">🟢 Compare revenue run rate to prior-year quarters for trend accuracy.</span><br><br><span class="flag-yellow">🟡 Note segment reporting changes or one-time items in the footnotes.</span><br><br><span class="flag-red">🔴 Footnotes often contain related-party disclosures, covenant violations, and legal contingencies.</span>`,
-    'DEF': `<span class="flag-yellow">🟡 Verify CEO pay is tied to measurable performance metrics, not just tenure.</span><br><br><span class="flag-red">🔴 Related-party transactions: loans to executives or family employment are Buffett red flags.</span><br><br><span class="flag-green">🟢 High insider ownership aligns management with shareholders — a positive signal.</span>`,
-    '8-K': `<span class="flag-yellow">🟡 Management changes (CEO/CFO) mid-cycle often precede earnings surprises or guidance cuts.</span><br><br><span class="flag-red">🔴 Off-balance-sheet agreements or related-party deals warrant deeper investigation.</span><br><br><span class="flag-green">🟢 Buyback authorizations and debt paydown announcements signal management confidence.</span>`,
-  };
-  const getNarrative = type => {
-    if (type.includes('10-K')) return narratives['10-K'];
-    if (type.includes('10-Q')) return narratives['10-Q'];
-    if (type.includes('DEF')) return narratives['DEF'];
-    return narratives['8-K'];
-  };
-
-  return `<div class="filing-list">
-    ${filings.slice(0, 30).map(f => `
-    <div class="filing-item" onclick="this.querySelector('.filing-narrative').style.display=this.querySelector('.filing-narrative').style.display==='block'?'none':'block'">
-      <div class="filing-header">
-        <span class="filing-type ${typeClass(f.type)}">${f.type}</span>
-        <span class="filing-desc">${typeDesc(f.type)}</span>
-        <span class="filing-date">${f.fillingDate || f.date || ''}</span>
-        ${f.finalLink || f.link ? `<a class="filing-link" href="${f.finalLink || f.link}" target="_blank" onclick="event.stopPropagation()">↗ SEC</a>` : ''}
-      </div>
-      <div class="filing-narrative">${getNarrative(f.type)}</div>
-    </div>`).join('')}
-  </div>`;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // COMPETITORS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -967,8 +915,7 @@ async function analyzeCompetitors() {
         fmp('/income-statement',        { symbol: t, limit: 10 }).catch(() => []),
         fmp('/balance-sheet-statement', { symbol: t, limit: 10 }).catch(() => []),
         fmp('/cash-flow-statement',     { symbol: t, limit: 10 }).catch(() => []),
-        fmp('/key-metrics',             { symbol: t, limit: 10 })
-          .catch(() => fmp('/ratios',   { symbol: t, limit: 10 }).catch(() => [])),
+        fmp('/key-metrics',             { symbol: t, limit: 10 }).catch(() => []),
         fmp('/profile',                 { symbol: t }),
       ]);
       const fin = buildFinancials(income, balance, cashFlow, keyMetrics);
