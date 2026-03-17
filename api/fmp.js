@@ -42,11 +42,8 @@ module.exports = async function handler(req, res) {
     '/key-metrics',
     '/ratios',
     '/financial-growth',
-    '/sec-filings',
     '/quote',
     '/search',
-    '/analyst-estimates',
-    '/rating',
     '/enterprise-values',
     '/historical-price-eod/full',
   ];
@@ -114,9 +111,6 @@ async function runDebug(apiKey, res) {
     { name: 'Key Metrics',           path: `/key-metrics?symbol=${sym}&limit=2` },
     { name: 'Ratios',                path: `/ratios?symbol=${sym}&limit=2` },
     { name: 'Financial Growth',      path: `/financial-growth?symbol=${sym}&limit=2` },
-    { name: 'SEC Filings',           path: `/sec-filings?symbol=${sym}&limit=5` },
-    { name: 'Analyst Estimates',     path: `/analyst-estimates?symbol=${sym}` },
-    { name: 'Rating',                path: `/rating?symbol=${sym}` },
   ];
 
   const results = await Promise.all(tests.map(async t => {
