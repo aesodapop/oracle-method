@@ -252,6 +252,7 @@ body::before {
     <span class="logo-sub">FMP · SEC · Buffett Intelligence</span>
   </div>
   <div class="header-right">
+    <button onclick="openDebug()" style="background:none;border:1px solid var(--border);color:var(--text3);font-family:var(--mono);font-size:10px;letter-spacing:1px;padding:8px 12px;cursor:pointer;border-radius:4px;transition:all 0.2s;text-transform:uppercase;" onmouseover="this.style.borderColor='var(--amber)';this.style.color='var(--amber)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">⚙ API Debug</button>
     <div class="search-bar">
       <input type="text" class="search-input" id="mainSearch" placeholder="TICKER" maxlength="10">
       <button class="search-btn" onclick="analyzeFromSearch()">ANALYZE</button>
@@ -403,47 +404,68 @@ async function runAnalysis(ticker) {
   setStatus(`Loading ${ticker}...`, 'loading');
 
   try {
-    // ── Step 1: Profile (required — validates ticker exists) ─────────────────
-    setStatus(`Looking up ${ticker} on FMP...`, 'loading');
+    // ── Step 1: Profile ───────────────────────────────────────────────────────
+    setStatus(`Looking up ${ticker}...`, 'loading');
     const profile = await fmp(`/profile/${ticker}`);
-
     if (!profile || !Array.isArray(profile) || !profile.length) {
-      throw new Error(
-        `Ticker "${ticker}" not found on Financial Modeling Prep. ` +
-        `Make sure it's a valid US exchange ticker (e.g. AAPL, MSFT, KO). ` +
-        `Foreign tickers may need exchange suffix (e.g. ASML.AS).`
-      );
+      throw new Error(`Ticker "${ticker}" not found on FMP. Check spelling (e.g. AAPL, MSFT, KO, BRK.B).`);
     }
-
     const co = profile[0];
     currentCompany = co.companyName || ticker;
-    setStatus(`Loading financials for ${currentCompany}...`, 'loading');
+    setStatus(`Fetching financials for ${currentCompany}...`, 'loading');
 
-    // ── Step 2: Financial statements in parallel, each with its own fallback ─
+    // ── Step 2: Try v3 statements first, auto-fall to v4 on 403 ─────────────
+    // FMP free keys work on v3 for most endpoints; some plans need v4.
+    async function fetchStatement(v3Path, v3Params, v4Path, v4Params) {
+      try {
+        const data = await fmp(v3Path, v3Params);
+        // FMP sometimes returns [] instead of 403 for plan limits
+        if (Array.isArray(data) && data.length > 0) return data;
+        throw new Error('empty');
+      } catch (e) {
+        if (v4Path) {
+          try {
+            console.log(`v3 failed (${e.message}), trying v4: ${v4Path}`);
+            const data = await fmp(v4Path, v4Params);
+            if (Array.isArray(data) && data.length > 0) return data;
+          } catch (e2) {
+            console.warn(`v4 also failed: ${e2.message}`);
+          }
+        }
+        return [];
+      }
+    }
+
     const [income, balanceSheet, cashFlow, keyMetrics, filings] = await Promise.all([
-      fmp(`/income-statement/${ticker}`,       { limit: 10, period: 'annual' })
-        .catch(e => { console.warn('income-statement failed:', e.message); return []; }),
-      fmp(`/balance-sheet-statement/${ticker}`, { limit: 10, period: 'annual' })
-        .catch(e => { console.warn('balance-sheet failed:', e.message); return []; }),
-      fmp(`/cash-flow-statement/${ticker}`,     { limit: 10, period: 'annual' })
-        .catch(e => { console.warn('cash-flow failed:', e.message); return []; }),
-      fmp(`/key-metrics/${ticker}`,             { limit: 10, period: 'annual' })
-        .catch(e => { console.warn('key-metrics failed:', e.message); return []; }),
-      fmp(`/sec-filings/${ticker}`,             { limit: 30 })
-        .catch(() => []),
+      fetchStatement(
+        `/income-statement/${ticker}`,        { limit: 10, period: 'annual' },
+        `/v4/income-statement`,               { symbol: ticker, period: 'annual', limit: 10 }
+      ),
+      fetchStatement(
+        `/balance-sheet-statement/${ticker}`, { limit: 10, period: 'annual' },
+        `/v4/balance-sheet-statement`,        { symbol: ticker, period: 'annual', limit: 10 }
+      ),
+      fetchStatement(
+        `/cash-flow-statement/${ticker}`,     { limit: 10, period: 'annual' },
+        `/v4/cash-flow-statement`,            { symbol: ticker, period: 'annual', limit: 10 }
+      ),
+      fetchStatement(
+        `/key-metrics/${ticker}`,             { limit: 10, period: 'annual' },
+        `/financial-ratios/${ticker}`,        { limit: 10, period: 'annual' }
+      ),
+      fmp(`/sec-filings/${ticker}`, { limit: 30 }).catch(() => []),
     ]);
 
-    // Require at least income statement to proceed
-    if (!income || !income.length) {
+    if (!income.length && !balanceSheet.length && !cashFlow.length) {
       throw new Error(
         `No financial data returned for "${ticker}". ` +
-        `Your FMP plan may not include this endpoint, or the ticker has no filings. ` +
-        `Check your FMP dashboard at financialmodelingprep.com.`
+        `This usually means your FMP free plan doesn't include financial statements. ` +
+        `Go to your live site and click "Run Diagnostic" — or visit: ` +
+        window.location.origin + `/api/fmp?debug=1 to see which endpoints your key can access.`
       );
     }
 
-    setStatus(`Calculating scores for ${currentCompany}...`, 'loading');
-
+    setStatus(`Scoring ${currentCompany}...`, 'loading');
     const fin = buildFinancials(income, balanceSheet, cashFlow, keyMetrics);
     currentFinancials = fin;
 
@@ -1176,6 +1198,83 @@ async function runDiagnostic() {
   }
 
   out.textContent = lines.join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEBUG
+// ─────────────────────────────────────────────────────────────────────────────
+function openDebug() {
+  document.getElementById('main').innerHTML = `
+  <div style="padding:32px;">
+    <div style="font-family:var(--serif);font-size:22px;color:var(--gold);margin-bottom:8px;">API Diagnostics</div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:24px;">Tests every FMP endpoint your key can access</div>
+    <button onclick="fetchDebug()" id="debugRunBtn" style="background:var(--gold);border:none;color:#000;font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:1px;padding:10px 20px;cursor:pointer;border-radius:4px;text-transform:uppercase;margin-bottom:24px;">▶ Run Endpoint Tests</button>
+    <div id="debugOutput"></div>
+  </div>`;
+}
+
+async function fetchDebug() {
+  const btn = document.getElementById('debugRunBtn');
+  const out = document.getElementById('debugOutput');
+  btn.textContent = 'Running...';
+  btn.disabled = true;
+  out.innerHTML = '<div style="font-family:var(--mono);font-size:11px;color:var(--text3);">Hitting all FMP endpoints...</div>';
+
+  try {
+    const resp = await fetch('/api/fmp?debug=1');
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      out.innerHTML = `<div class="error-msg">${data.error || 'Debug endpoint failed: ' + resp.status}</div>`;
+      return;
+    }
+
+    const rows = (data.results || []).map(r => {
+      const color = r.available.includes('YES') ? 'var(--green)' : 'var(--red)';
+      return `<tr>
+        <td style="padding:10px 14px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px;color:var(--text2);">${r.endpoint}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:11px;color:${color};font-weight:500;">${r.available}</td>
+        <td style="padding:10px 14px;border-bottom:1px solid var(--border);font-family:var(--mono);font-size:10px;color:var(--text3);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.detail}</td>
+      </tr>`;
+    }).join('');
+
+    const working = (data.results || []).filter(r => r.available.includes('YES')).length;
+    const total = (data.results || []).length;
+
+    out.innerHTML = `
+    <div style="margin-bottom:16px;font-family:var(--mono);font-size:12px;color:${working>5?'var(--green)':working>2?'var(--yellow)':'var(--red)'};">
+      ${working}/${total} endpoints accessible with your API key
+      ${working === 0 ? ' — Check that FMP_API_KEY is set correctly in Vercel and redeployed.' : ''}
+      ${working > 0 && working < 4 ? ' — Free plan detected. Financial statements (income/balance/cashflow) require a paid FMP plan.' : ''}
+      ${working >= 4 ? ' — Looks good!' : ''}
+    </div>
+    <div style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr>
+          <th style="text-align:left;padding:10px 14px;background:var(--bg3);color:var(--text3);font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--border);">Endpoint</th>
+          <th style="text-align:left;padding:10px 14px;background:var(--bg3);color:var(--text3);font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--border);">Available</th>
+          <th style="text-align:left;padding:10px 14px;background:var(--bg3);color:var(--text3);font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--border);">Response Preview</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${working < 4 ? `
+    <div style="margin-top:20px;background:rgba(212,117,42,0.08);border:1px solid rgba(212,117,42,0.3);border-radius:6px;padding:16px 20px;">
+      <div style="font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--amber);text-transform:uppercase;margin-bottom:10px;">How to fix 403 errors</div>
+      <div style="font-family:var(--sans);font-size:12px;color:var(--text2);line-height:1.8;">
+        1. The <strong>FMP free plan</strong> only includes <code>/profile/</code> and <code>/quote/</code>.<br>
+        2. Financial statements (<code>income-statement</code>, <code>balance-sheet</code>, <code>cash-flow</code>, <code>key-metrics</code>) require the <strong>Starter plan (~$19/mo)</strong> or higher.<br>
+        3. Go to <a href="https://financialmodelingprep.com/developer/docs/pricing" target="_blank" style="color:var(--gold);">financialmodelingprep.com/developer/docs/pricing</a> to upgrade.<br>
+        4. After upgrading, re-run this diagnostic — all green endpoints will work immediately.
+      </div>
+    </div>` : ''}`;
+
+  } catch(e) {
+    out.innerHTML = `<div class="error-msg">Could not reach /api/fmp?debug=1 — ${e.message}<br><br>Make sure api/fmp.js is deployed on Vercel.</div>`;
+  }
+
+  btn.textContent = '▶ Run Again';
+  btn.disabled = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
