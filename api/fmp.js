@@ -1,9 +1,10 @@
 /**
- * Vercel Serverless Function — FMP Proxy
+ * Vercel Serverless Function — FMP Stable API Proxy
  * File: api/fmp.js
  *
- * Proxies requests to Financial Modeling Prep, keeping the API key server-side.
- * Also handles a /api/fmp?debug=1 mode to show raw FMP responses for troubleshooting.
+ * Uses FMP's /stable/ base URL (the current endpoint structure).
+ * The frontend calls /api/fmp?path=/income-statement&symbol=AAPL&limit=10
+ * This function appends the secret FMP_API_KEY and proxies to FMP.
  */
 
 module.exports = async function handler(req, res) {
@@ -23,10 +24,8 @@ module.exports = async function handler(req, res) {
 
   const { path: rawPath, debug, ...forwardParams } = req.query;
 
-  // ── Debug mode: test all key endpoints and report status ─────────────────
-  if (debug === '1' || rawPath === '/debug') {
-    return runDebug(apiKey, res);
-  }
+  // ── Debug mode: test all endpoints and show which ones work ───────────────
+  if (debug === '1') return runDebug(apiKey, res);
 
   if (!rawPath) {
     return res.status(400).json({ error: 'Missing ?path= parameter' });
@@ -34,33 +33,43 @@ module.exports = async function handler(req, res) {
 
   const fmpPath = decodeURIComponent(rawPath);
 
-  // Whitelist
+  // Whitelist of allowed /stable/ paths
   const allowed = [
-    '/profile/', '/income-statement/', '/balance-sheet-statement/',
-    '/cash-flow-statement/', '/key-metrics/', '/financial-ratios/',
-    '/sec-filings/', '/earnings/', '/historical-price-full/', '/quote/',
-    '/search', '/financial-statements/', '/analyst-estimates/', '/rating/',
-    '/v4/income-statement', '/v4/balance-sheet', '/v4/cash-flow',
-    '/financial-growth/', '/enterprise-values/',
+    '/profile',
+    '/income-statement',
+    '/balance-sheet-statement',
+    '/cash-flow-statement',
+    '/key-metrics',
+    '/ratios',
+    '/financial-growth',
+    '/sec-filings',
+    '/quote',
+    '/search',
+    '/analyst-estimates',
+    '/rating',
+    '/enterprise-values',
+    '/historical-price-eod/full',
   ];
-  if (!allowed.some(p => fmpPath.startsWith(p))) {
-    return res.status(403).json({ error: 'Path not whitelisted: ' + fmpPath });
+
+  if (!allowed.some(p => fmpPath === p || fmpPath.startsWith(p + '?') || fmpPath.startsWith(p + '/'))) {
+    return res.status(403).json({
+      error: 'Path not whitelisted: ' + fmpPath,
+      allowedPaths: allowed
+    });
   }
 
-  // Build URL — paths starting with /v4/ use the v4 base, others use v3
-  const base = fmpPath.startsWith('/v4/')
-    ? 'https://financialmodelingprep.com/api'
-    : 'https://financialmodelingprep.com/api/v3';
-
-  const pathPart = fmpPath.startsWith('/v4/') ? fmpPath : fmpPath;
+  // All requests go to https://financialmodelingprep.com/stable/<path>
   const qs = new URLSearchParams({ ...forwardParams, apikey: apiKey }).toString();
-  const fmpUrl = base + pathPart + '?' + qs;
+  const fmpUrl = 'https://financialmodelingprep.com/stable' + fmpPath + '?' + qs;
+
+  console.log('Proxying to:', fmpUrl.replace(apiKey, 'REDACTED'));
 
   try {
     const upstream = await fetch(fmpUrl, {
       headers: { 'User-Agent': 'OracleMethod/1.0' },
       signal: AbortSignal.timeout(20000),
     });
+
     const body = await upstream.text();
 
     if (!upstream.ok) {
@@ -69,15 +78,15 @@ module.exports = async function handler(req, res) {
         const parsed = JSON.parse(body);
         detail = parsed['Error Message'] || parsed.message || parsed.error || detail;
       } catch (_) {}
-
       console.error(`FMP ${upstream.status} [${fmpPath}]:`, detail);
       return res.status(upstream.status).json({
         error: `FMP returned ${upstream.status} for ${fmpPath}`,
         detail,
+        fmpUrl: fmpUrl.replace(apiKey, 'REDACTED'),
         hint: upstream.status === 403
-          ? 'This endpoint requires a paid FMP plan. Check /api/fmp?debug=1 to see which endpoints your key can access.'
+          ? 'This endpoint may require a higher FMP plan. Visit /api/fmp?debug=1 to test all endpoints.'
           : upstream.status === 401
-          ? 'Invalid API key. Re-copy it from financialmodelingprep.com/developer/docs'
+          ? 'Invalid API key — re-copy it from financialmodelingprep.com'
           : undefined
       });
     }
@@ -85,57 +94,63 @@ module.exports = async function handler(req, res) {
     res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate=86400');
     res.setHeader('Content-Type', 'application/json');
     return res.status(200).send(body);
+
   } catch (err) {
-    return res.status(502).json({ error: 'Proxy fetch failed: ' + err.message });
+    console.error('Proxy fetch error:', err.message);
+    return res.status(502).json({ error: 'Proxy failed: ' + err.message });
   }
 };
 
-// ── Debug: hit every endpoint we use and report which ones work ─────────────
+// ── Debug: test every endpoint and report status ──────────────────────────
 async function runDebug(apiKey, res) {
-  const ticker = 'AAPL';
+  const sym = 'AAPL';
+  const base = 'https://financialmodelingprep.com/stable';
   const tests = [
-    { name: 'Profile (v3)',            url: `/api/v3/profile/${ticker}` },
-    { name: 'Income Statement (v3)',   url: `/api/v3/income-statement/${ticker}?limit=2&period=annual` },
-    { name: 'Balance Sheet (v3)',      url: `/api/v3/balance-sheet-statement/${ticker}?limit=2&period=annual` },
-    { name: 'Cash Flow (v3)',          url: `/api/v3/cash-flow-statement/${ticker}?limit=2&period=annual` },
-    { name: 'Key Metrics (v3)',        url: `/api/v3/key-metrics/${ticker}?limit=2&period=annual` },
-    { name: 'Financial Ratios (v3)',   url: `/api/v3/financial-ratios/${ticker}?limit=2&period=annual` },
-    { name: 'Income Statement (v4)',   url: `/api/v4/income-statement?symbol=${ticker}&period=annual&limit=2` },
-    { name: 'Balance Sheet (v4)',      url: `/api/v4/balance-sheet-statement?symbol=${ticker}&period=annual&limit=2` },
-    { name: 'Cash Flow (v4)',          url: `/api/v4/cash-flow-statement?symbol=${ticker}&period=annual&limit=2` },
-    { name: 'Financial Growth (v3)',   url: `/api/v3/financial-growth/${ticker}?limit=2&period=annual` },
-    { name: 'SEC Filings (v3)',        url: `/api/v3/sec-filings/${ticker}?limit=5` },
-    { name: 'Quote (v3)',              url: `/api/v3/quote/${ticker}` },
-    { name: 'Enterprise Value (v3)',   url: `/api/v3/enterprise-values/${ticker}?limit=2&period=annual` },
+    { name: 'Profile',               path: `/profile?symbol=${sym}` },
+    { name: 'Quote',                 path: `/quote?symbol=${sym}` },
+    { name: 'Income Statement',      path: `/income-statement?symbol=${sym}&limit=2` },
+    { name: 'Balance Sheet',         path: `/balance-sheet-statement?symbol=${sym}&limit=2` },
+    { name: 'Cash Flow',             path: `/cash-flow-statement?symbol=${sym}&limit=2` },
+    { name: 'Key Metrics',           path: `/key-metrics?symbol=${sym}&limit=2` },
+    { name: 'Ratios',                path: `/ratios?symbol=${sym}&limit=2` },
+    { name: 'Financial Growth',      path: `/financial-growth?symbol=${sym}&limit=2` },
+    { name: 'SEC Filings',           path: `/sec-filings?symbol=${sym}&limit=5` },
+    { name: 'Analyst Estimates',     path: `/analyst-estimates?symbol=${sym}` },
+    { name: 'Rating',                path: `/rating?symbol=${sym}` },
   ];
 
   const results = await Promise.all(tests.map(async t => {
-    const url = `https://financialmodelingprep.com${t.url}${t.url.includes('?') ? '&' : '?'}apikey=${apiKey}`;
+    const url = `${base}${t.path}&apikey=${apiKey}`;
     try {
       const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
       const text = await r.text();
       let preview = '';
       try {
         const d = JSON.parse(text);
-        if (Array.isArray(d) && d.length > 0) preview = `array[${d.length}] — first keys: ${Object.keys(d[0]).slice(0,5).join(', ')}`;
-        else if (d['Error Message']) preview = 'ERROR: ' + d['Error Message'];
-        else if (d.error) preview = 'ERROR: ' + d.error;
-        else preview = JSON.stringify(d).substring(0, 80);
-      } catch (_) { preview = text.substring(0, 80); }
+        if (Array.isArray(d) && d.length > 0) {
+          preview = `array[${d.length}] keys: ${Object.keys(d[0]).slice(0, 6).join(', ')}`;
+        } else if (d && d['Error Message']) {
+          preview = 'FMP Error: ' + d['Error Message'];
+        } else if (d && d.error) {
+          preview = 'Error: ' + d.error;
+        } else {
+          preview = text.substring(0, 100);
+        }
+      } catch (_) { preview = text.substring(0, 100); }
       return { name: t.name, status: r.status, ok: r.ok, preview };
     } catch (e) {
-      return { name: t.name, status: 'ERR', ok: false, preview: e.message };
+      return { name: t.name, status: 'TIMEOUT', ok: false, preview: e.message };
     }
   }));
 
   return res.status(200).json({
-    info: 'FMP endpoint availability for your API key',
-    ticker,
+    message: 'FMP /stable/ endpoint availability for your API key',
+    ticker: sym,
     results: results.map(r => ({
       endpoint: r.name,
-      status: r.status,
-      available: r.ok ? '✅ YES' : '❌ NO',
-      detail: r.preview
+      httpStatus: r.status,
+      available: r.ok ? '✅ YES' : '❌ NO  (403 = plan limit)',
+      preview: r.preview
     }))
   });
 }
