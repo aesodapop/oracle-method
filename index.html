@@ -404,64 +404,37 @@ async function runAnalysis(ticker) {
   setStatus(`Loading ${ticker}...`, 'loading');
 
   try {
-    // ── Step 1: Profile ───────────────────────────────────────────────────────
+    // ── All FMP calls use /stable/ base with ?symbol= query param ─────────────
     setStatus(`Looking up ${ticker}...`, 'loading');
-    const profile = await fmp(`/profile/${ticker}`);
+
+    const profile = await fmp('/profile', { symbol: ticker });
     if (!profile || !Array.isArray(profile) || !profile.length) {
-      throw new Error(`Ticker "${ticker}" not found on FMP. Check spelling (e.g. AAPL, MSFT, KO, BRK.B).`);
+      throw new Error(`Ticker "${ticker}" not found. Try exact exchange symbols: AAPL, MSFT, KO, BRK.B`);
     }
     const co = profile[0];
     currentCompany = co.companyName || ticker;
-    setStatus(`Fetching financials for ${currentCompany}...`, 'loading');
-
-    // ── Step 2: Try v3 statements first, auto-fall to v4 on 403 ─────────────
-    // FMP free keys work on v3 for most endpoints; some plans need v4.
-    async function fetchStatement(v3Path, v3Params, v4Path, v4Params) {
-      try {
-        const data = await fmp(v3Path, v3Params);
-        // FMP sometimes returns [] instead of 403 for plan limits
-        if (Array.isArray(data) && data.length > 0) return data;
-        throw new Error('empty');
-      } catch (e) {
-        if (v4Path) {
-          try {
-            console.log(`v3 failed (${e.message}), trying v4: ${v4Path}`);
-            const data = await fmp(v4Path, v4Params);
-            if (Array.isArray(data) && data.length > 0) return data;
-          } catch (e2) {
-            console.warn(`v4 also failed: ${e2.message}`);
-          }
-        }
-        return [];
-      }
-    }
+    setStatus(`Fetching 10-year financials for ${currentCompany}...`, 'loading');
 
     const [income, balanceSheet, cashFlow, keyMetrics, filings] = await Promise.all([
-      fetchStatement(
-        `/income-statement/${ticker}`,        { limit: 10, period: 'annual' },
-        `/v4/income-statement`,               { symbol: ticker, period: 'annual', limit: 10 }
-      ),
-      fetchStatement(
-        `/balance-sheet-statement/${ticker}`, { limit: 10, period: 'annual' },
-        `/v4/balance-sheet-statement`,        { symbol: ticker, period: 'annual', limit: 10 }
-      ),
-      fetchStatement(
-        `/cash-flow-statement/${ticker}`,     { limit: 10, period: 'annual' },
-        `/v4/cash-flow-statement`,            { symbol: ticker, period: 'annual', limit: 10 }
-      ),
-      fetchStatement(
-        `/key-metrics/${ticker}`,             { limit: 10, period: 'annual' },
-        `/financial-ratios/${ticker}`,        { limit: 10, period: 'annual' }
-      ),
-      fmp(`/sec-filings/${ticker}`, { limit: 30 }).catch(() => []),
+      fmp('/income-statement',       { symbol: ticker, limit: 10 })
+        .catch(e => { console.warn('income-statement:', e.message); return []; }),
+      fmp('/balance-sheet-statement',{ symbol: ticker, limit: 10 })
+        .catch(e => { console.warn('balance-sheet:', e.message); return []; }),
+      fmp('/cash-flow-statement',    { symbol: ticker, limit: 10 })
+        .catch(e => { console.warn('cash-flow:', e.message); return []; }),
+      fmp('/key-metrics',            { symbol: ticker, limit: 10 })
+        .catch(e => {
+          console.warn('key-metrics failed, trying ratios:', e.message);
+          return fmp('/ratios', { symbol: ticker, limit: 10 }).catch(() => []);
+        }),
+      fmp('/sec-filings',            { symbol: ticker, limit: 30 })
+        .catch(() => []),
     ]);
 
     if (!income.length && !balanceSheet.length && !cashFlow.length) {
       throw new Error(
-        `No financial data returned for "${ticker}". ` +
-        `This usually means your FMP free plan doesn't include financial statements. ` +
-        `Go to your live site and click "Run Diagnostic" — or visit: ` +
-        window.location.origin + `/api/fmp?debug=1 to see which endpoints your key can access.`
+        `No financial statements returned for "${ticker}". ` +
+        `Click ⚙ API Debug in the header to test which endpoints your FMP plan supports.`
       );
     }
 
@@ -488,33 +461,41 @@ async function runAnalysis(ticker) {
 // FMP returns newest-first; we reverse to oldest-first for chart order
 // ─────────────────────────────────────────────────────────────────────────────
 function buildFinancials(income, balance, cashFlow, keyMetrics) {
-  function toSeries(arr, key) {
-    return [...arr].reverse().map(row => ({
-      year: parseInt((row.date || row.calendarYear || '2000').substring(0, 4)),
-      val:  row[key] ?? 0,
-    })).filter(d => d.val !== null && d.val !== undefined);
+  // FMP /stable/ returns arrays newest-first; we reverse to oldest-first for charts
+  function toSeries(arr, ...keys) {
+    if (!Array.isArray(arr) || !arr.length) return [];
+    return [...arr].reverse().map(row => {
+      // Try each key in order — handles field name differences between plan tiers
+      let val = null;
+      for (const k of keys) {
+        if (row[k] != null && row[k] !== '') { val = Number(row[k]); break; }
+      }
+      const dateStr = row.date || row.calendarYear || row.fiscalYear || '2000-01-01';
+      return { year: parseInt(String(dateStr).substring(0, 4)), val: val ?? 0 };
+    }).filter(d => !isNaN(d.year) && d.year >= 2000);
   }
 
-  const revenue     = toSeries(income,      'revenue');
-  const netIncome   = toSeries(income,      'netIncome');
+  const revenue     = toSeries(income,      'revenue', 'totalRevenue');
+  const netIncome   = toSeries(income,      'netIncome', 'netIncomeApplicableToCommonShares');
   const grossProfit = toSeries(income,      'grossProfit');
-  const ebitda      = toSeries(income,      'ebitda');
-  const eps         = toSeries(income,      'eps');
-  const shares      = toSeries(income,      'weightedAverageShsOut');
-  const operatingCF = toSeries(cashFlow,    'operatingCashFlow');
-  const capex       = toSeries(cashFlow,    'capitalExpenditure');
-  const debt        = toSeries(balance,     'longTermDebt');
-  const equity      = toSeries(balance,     'totalStockholdersEquity');
+  const ebitda      = toSeries(income,      'ebitda', 'operatingIncome');
+  const eps         = toSeries(income,      'eps', 'epsdiluted', 'epsBasic');
+  const shares      = toSeries(income,      'weightedAverageShsOut', 'weightedAverageShsOutDil', 'sharesOutstanding');
+  const operatingCF = toSeries(cashFlow,    'operatingCashFlow', 'netCashProvidedByOperatingActivities');
+  const capex       = toSeries(cashFlow,    'capitalExpenditure', 'purchasesOfPropertyPlantAndEquipment');
+  const debt        = toSeries(balance,     'longTermDebt', 'longTermDebtAndCapitalLeaseObligation');
+  const equity      = toSeries(balance,     'totalStockholdersEquity', 'stockholdersEquity');
   const totalAssets = toSeries(balance,     'totalAssets');
-  const roe         = toSeries(keyMetrics,  'roe');
-  const roic        = toSeries(keyMetrics,  'roic');
-  const peRatio     = toSeries(keyMetrics,  'peRatio');
 
-  // FCF = operatingCF - |capex| (capex often negative in FMP)
+  // Key metrics — /stable/key-metrics or /stable/ratios
+  const roe   = toSeries(keyMetrics, 'roe',  'returnOnEquity');
+  const roic  = toSeries(keyMetrics, 'roic', 'returnOnInvestedCapital');
+  const peRatio = toSeries(keyMetrics, 'peRatio', 'priceToEarningsRatio');
+
+  // FCF = operatingCF minus absolute capex value
   const fcf = operatingCF.map(cf => {
     const cx = capex.find(c => c.year === cf.year);
-    const capexVal = cx ? Math.abs(cx.val) : 0;
-    return { year: cf.year, val: cf.val - capexVal };
+    return { year: cf.year, val: cf.val - Math.abs(cx ? cx.val : 0) };
   });
 
   return { revenue, netIncome, grossProfit, ebitda, eps, shares, operatingCF, capex, fcf, debt, equity, totalAssets, roe, roic, peRatio };
@@ -983,11 +964,12 @@ async function analyzeCompetitors() {
     try {
       setStatus(`Analyzing ${t}...`, 'loading');
       const [income, balance, cashFlow, keyMetrics, profile] = await Promise.all([
-        fmp(`/income-statement/${t}`, { limit: 10, period: 'annual' }),
-        fmp(`/balance-sheet-statement/${t}`, { limit: 10, period: 'annual' }),
-        fmp(`/cash-flow-statement/${t}`, { limit: 10, period: 'annual' }),
-        fmp(`/key-metrics/${t}`, { limit: 10, period: 'annual' }),
-        fmp(`/profile/${t}`),
+        fmp('/income-statement',        { symbol: t, limit: 10 }).catch(() => []),
+        fmp('/balance-sheet-statement', { symbol: t, limit: 10 }).catch(() => []),
+        fmp('/cash-flow-statement',     { symbol: t, limit: 10 }).catch(() => []),
+        fmp('/key-metrics',             { symbol: t, limit: 10 })
+          .catch(() => fmp('/ratios',   { symbol: t, limit: 10 }).catch(() => [])),
+        fmp('/profile',                 { symbol: t }),
       ]);
       const fin = buildFinancials(income, balance, cashFlow, keyMetrics);
       const f = computeFormulaScore(fin);
